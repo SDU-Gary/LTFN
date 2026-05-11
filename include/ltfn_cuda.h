@@ -21,7 +21,9 @@ public:
 
     const LTFNConfig& config() const noexcept override;
     const std::vector<Eigen::MatrixXd>& weights() const override;
+    const std::vector<Eigen::VectorXd>& biases() const override;
     void set_weights(const std::vector<Eigen::MatrixXd>& new_weights) override;
+    void set_biases(const std::vector<Eigen::VectorXd>& new_biases) override;
     void reset_states(const Eigen::VectorXd& input) override;
     void advance(const Eigen::VectorXd& input, bool update_weights) override;
     void advance_current(bool update_weights) override;
@@ -46,15 +48,20 @@ private:
     void validate_dims() const;
     void ensure_input_shape(const Eigen::VectorXd& input) const;
     void ensure_predictions_current() const;
+    void initialize_host_states_from_input(const Eigen::VectorXd& input);
     void ensure_batch_capacity(int batch_size);
     void allocate_buffers();
     void allocate_batch_buffers(int batch_size);
     void release_buffers() noexcept;
     void release_batch_buffers() noexcept;
     void compute_predictions_errors_and_deltas() const;
+    void compute_layer_prediction_error_delta(std::size_t layer) const;
+    void update_error_precisions_from_current_errors();
+    void update_error_precisions_from_batch_errors(int batch_size);
     StepDiagnostics collect_diagnostics(bool update_weights);
     void upload_batch_inputs(const std::vector<const Eigen::VectorXd*>& inputs);
     void compute_batch_errors_and_deltas(int batch_size);
+    void compute_batch_layer_error_delta(std::size_t layer, int batch_size);
     double compute_batch_effective_gradient(std::size_t layer_index, int batch_size);
     StepDiagnostics collect_batch_diagnostics(
         int batch_size,
@@ -62,10 +69,13 @@ private:
         const std::vector<double>* gradient_norms = nullptr,
         const std::vector<double>* update_norms = nullptr);
     void upload_all_weights();
+    void upload_all_biases();
     void download_all_weights() const;
+    void download_all_biases() const;
     void download_all_states() const;
     void download_reconstruction() const;
     void zero_weight_velocities();
+    void zero_bias_velocities();
     void zero_latent_states();
     void synchronize() const;
 
@@ -73,12 +83,16 @@ private:
     cublasHandle_t cublas_{nullptr};
 
     mutable std::vector<Eigen::MatrixXd> host_weights_;
+    mutable std::vector<Eigen::VectorXd> host_biases_;
     mutable std::vector<Eigen::VectorXd> host_states_;
     mutable Eigen::VectorXd host_reconstruction_;
     mutable Eigen::MatrixXd host_batch_visible_;
+    mutable Eigen::VectorXd host_visible_error_precisions_;
     mutable bool predictions_dirty_{false};
 
     std::vector<double*> device_weights_;
+    std::vector<double*> device_biases_;
+    double* device_visible_error_precisions_{nullptr};
     std::vector<double*> device_states_;
     std::vector<double*> device_predictions_;
     std::vector<double*> device_errors_;
@@ -88,6 +102,7 @@ private:
     std::vector<double*> device_next_states_;
     std::vector<double*> device_back_buffers_;
     std::vector<double*> device_weight_velocities_;
+    std::vector<double*> device_bias_velocities_;
 
     int batch_capacity_{0};
     std::vector<double*> device_batch_states_;
@@ -96,11 +111,17 @@ private:
     std::vector<double*> device_batch_deltas_;
     std::vector<double*> device_batch_back_buffers_;
     std::vector<double*> device_batch_gradients_;
+    std::vector<double*> device_batch_bias_gradients_;
     std::vector<double*> device_batch_centered_states_;
     std::vector<double*> device_batch_decor_signals_;
     std::vector<double*> device_batch_covariances_;
     std::vector<double*> device_batch_state_means_;
+    double* device_batch_ones_{nullptr};
     std::vector<double> layer_second_moments_;
+    std::vector<double> layer_error_second_moments_;
+    std::vector<double> layer_error_precisions_;
+    Eigen::VectorXd visible_error_second_moments_;
+    Eigen::VectorXd visible_error_precisions_;
     double current_learning_rate_{0.0};
     double momentum_beta_{0.0};
 };

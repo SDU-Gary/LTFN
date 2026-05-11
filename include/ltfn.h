@@ -20,6 +20,11 @@ enum class VisibleLoss {
     Bce
 };
 
+enum class StateInit {
+    Zero,
+    Tied
+};
+
 struct LTFNConfig {
     std::vector<int> dims{784, 256, 64, 32};
     double tau_r{0.1};
@@ -27,6 +32,15 @@ struct LTFNConfig {
     double dt_r{0.1};
     double dt_w{1.0};
     VisibleLoss visible_loss{VisibleLoss::Mse};
+    bool use_biases{false};
+    bool visible_unit_precision{false};
+    StateInit state_init{StateInit::Zero};
+    double error_precision_beta{0.0};
+    double error_precision_epsilon{1e-4};
+    double error_precision_min{0.25};
+    double error_precision_max{4.0};
+    double transient_gate_tau{0.0};
+    bool sequential_inference{false};
     double layer_adapt_beta{0.0};
     double layer_adapt_epsilon{1e-8};
     double decorrelation_lambda{0.0};
@@ -78,7 +92,9 @@ public:
 
     virtual const LTFNConfig& config() const noexcept = 0;
     virtual const std::vector<Eigen::MatrixXd>& weights() const = 0;
+    virtual const std::vector<Eigen::VectorXd>& biases() const = 0;
     virtual void set_weights(const std::vector<Eigen::MatrixXd>& new_weights) = 0;
+    virtual void set_biases(const std::vector<Eigen::VectorXd>& new_biases) = 0;
     virtual void reset_states(const Eigen::VectorXd& input) = 0;
     virtual void advance(const Eigen::VectorXd& input, bool update_weights) = 0;
     virtual void advance_current(bool update_weights) = 0;
@@ -102,6 +118,7 @@ public:
 
 double compute_mse(const Eigen::VectorXd& expected, const Eigen::VectorXd& actual);
 std::string visible_loss_to_string(VisibleLoss visible_loss);
+std::string state_init_to_string(StateInit state_init);
 std::string backend_to_string(ComputeBackend backend);
 bool is_cuda_backend_compiled() noexcept;
 std::unique_ptr<ILTFNModel> create_model(const LTFNConfig& config, std::uint32_t seed, ComputeBackend backend);
@@ -114,9 +131,11 @@ public:
 
     const LTFNConfig& config() const noexcept override;
     const std::vector<Eigen::MatrixXd>& weights() const override;
+    const std::vector<Eigen::VectorXd>& biases() const override;
     std::vector<Eigen::MatrixXd>& mutable_weights() noexcept;
 
     void set_weights(const std::vector<Eigen::MatrixXd>& new_weights) override;
+    void set_biases(const std::vector<Eigen::VectorXd>& new_biases) override;
     void reset_states(const Eigen::VectorXd& input) override;
     void advance(const Eigen::VectorXd& input, bool update_weights) override;
     void advance_current(bool update_weights) override;
@@ -141,9 +160,12 @@ public:
 
 private:
     void validate_dims() const;
+    void initialize_latent_states();
     void compute_predictions_and_errors() const;
+    void compute_layer_prediction_error(std::size_t layer) const;
     void ensure_predictions_current() const;
     void ensure_input_shape(const Eigen::VectorXd& input) const;
+    void update_error_precisions_from_errors();
 
     LTFNConfig config_;
     std::vector<Eigen::MatrixXd> weights_;
@@ -152,8 +174,14 @@ private:
     mutable std::vector<Eigen::VectorXd> errors_;
     mutable std::vector<Eigen::VectorXd> pre_activations_;
     mutable std::vector<Eigen::VectorXd> sigmoid_derivatives_;
+    std::vector<Eigen::VectorXd> biases_;
     std::vector<Eigen::MatrixXd> weight_velocities_;
+    std::vector<Eigen::VectorXd> bias_velocities_;
     std::vector<double> layer_second_moments_;
+    std::vector<double> layer_error_second_moments_;
+    std::vector<double> layer_error_precisions_;
+    Eigen::VectorXd visible_error_second_moments_;
+    Eigen::VectorXd visible_error_precisions_;
     double current_learning_rate_{0.0};
     double momentum_beta_{0.0};
     mutable bool predictions_dirty_{false};

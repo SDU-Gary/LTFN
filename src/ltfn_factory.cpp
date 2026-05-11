@@ -19,6 +19,16 @@ std::string visible_loss_to_string(VisibleLoss visible_loss) {
     return "unknown";
 }
 
+std::string state_init_to_string(StateInit state_init) {
+    switch (state_init) {
+        case StateInit::Zero:
+            return "zero";
+        case StateInit::Tied:
+            return "tied";
+    }
+    return "unknown";
+}
+
 std::string backend_to_string(ComputeBackend backend) {
     switch (backend) {
         case ComputeBackend::Cpu:

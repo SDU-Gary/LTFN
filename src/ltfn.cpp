@@ -39,6 +39,11 @@ Eigen::VectorXd sigmoid_derivative_vec(const Eigen::VectorXd& values) {
     return values.unaryExpr([](double value) { return sigmoid_derivative_from_pre_activation(value); });
 }
 
+Eigen::MatrixXd sigmoid_matrix(const Eigen::MatrixXd& values) {
+    const Eigen::ArrayXXd clipped = values.array().max(-500.0).min(500.0);
+    return (1.0 / (1.0 + (-clipped).exp())).matrix();
+}
+
 Eigen::VectorXd layer_delta_vec(
     const Eigen::VectorXd& errors,
     const Eigen::VectorXd& sigmoid_derivatives,
@@ -68,6 +73,30 @@ double binary_cross_entropy_energy(
     return energy;
 }
 
+double weighted_binary_cross_entropy_energy(
+    const Eigen::VectorXd& target,
+    const Eigen::VectorXd& prediction,
+    const Eigen::VectorXd& precisions) {
+    double energy = 0.0;
+    for (Eigen::Index i = 0; i < target.size(); ++i) {
+        energy += precisions(i) * binary_cross_entropy_scalar(target(i), prediction(i));
+    }
+    return energy;
+}
+
+double weighted_binary_cross_entropy_energy(
+    const Eigen::MatrixXd& target,
+    const Eigen::MatrixXd& prediction,
+    const Eigen::VectorXd& precisions) {
+    double energy = 0.0;
+    for (Eigen::Index col = 0; col < target.cols(); ++col) {
+        for (Eigen::Index row = 0; row < target.rows(); ++row) {
+            energy += precisions(row) * binary_cross_entropy_scalar(target(row, col), prediction(row, col));
+        }
+    }
+    return energy;
+}
+
 double blend_second_moment(double previous, double beta, double mean_square) {
     return beta * previous + (1.0 - beta) * mean_square;
 }
@@ -91,6 +120,34 @@ Eigen::MatrixXd compute_decorrelation_signal(const Eigen::MatrixXd& batch_states
     return covariance * centered;
 }
 
+void normalize_precision_vector(std::vector<double>& precisions, double min_value, double max_value) {
+    if (precisions.empty()) {
+        return;
+    }
+
+    double log_sum = 0.0;
+    for (double precision : precisions) {
+        log_sum += std::log(std::max(precision, 1e-12));
+    }
+    const double geometric_mean = std::exp(log_sum / static_cast<double>(precisions.size()));
+    for (double& precision : precisions) {
+        precision = std::clamp(precision / geometric_mean, min_value, max_value);
+    }
+}
+
+void normalize_precision_vector(Eigen::VectorXd& precisions, double min_value, double max_value) {
+    if (precisions.size() == 0) {
+        return;
+    }
+
+    double log_sum = 0.0;
+    for (Eigen::Index i = 0; i < precisions.size(); ++i) {
+        log_sum += std::log(std::max(precisions(i), 1e-12));
+    }
+    const double geometric_mean = std::exp(log_sum / static_cast<double>(precisions.size()));
+    precisions = (precisions.array() / geometric_mean).max(min_value).min(max_value).matrix();
+}
+
 }  // namespace
 
 double compute_mse(const Eigen::VectorXd& expected, const Eigen::VectorXd& actual) {
@@ -110,12 +167,17 @@ LTFN::LTFN(const LTFNConfig& config, std::uint32_t seed)
 
     weights_.reserve(layers);
     weight_velocities_.reserve(layers);
+    bias_velocities_.reserve(layers);
     layer_second_moments_.reserve(layers);
+    layer_error_second_moments_.reserve(layers);
+    layer_error_precisions_.reserve(layers);
     states_.reserve(config_.dims.size());
     predictions_.reserve(layers);
     errors_.reserve(layers);
     pre_activations_.reserve(layers);
     sigmoid_derivatives_.reserve(layers);
+    visible_error_second_moments_ = Eigen::VectorXd::Zero(config_.dims.front());
+    visible_error_precisions_ = Eigen::VectorXd::Ones(config_.dims.front());
 
     for (std::size_t l = 0; l < config_.dims.size(); ++l) {
         states_.emplace_back(Eigen::VectorXd::Zero(config_.dims[l]));
@@ -136,7 +198,11 @@ LTFN::LTFN(const LTFNConfig& config, std::uint32_t seed)
         }
         weights_.push_back(std::move(weight));
         weight_velocities_.emplace_back(Eigen::MatrixXd::Zero(n_out, n_in));
+        biases_.emplace_back(Eigen::VectorXd::Zero(n_out));
+        bias_velocities_.emplace_back(Eigen::VectorXd::Zero(n_out));
         layer_second_moments_.push_back(0.0);
+        layer_error_second_moments_.push_back(0.0);
+        layer_error_precisions_.push_back(1.0);
 
         predictions_.emplace_back(Eigen::VectorXd::Zero(n_out));
         errors_.emplace_back(Eigen::VectorXd::Zero(n_out));
@@ -151,6 +217,10 @@ const LTFNConfig& LTFN::config() const noexcept {
 
 const std::vector<Eigen::MatrixXd>& LTFN::weights() const {
     return weights_;
+}
+
+const std::vector<Eigen::VectorXd>& LTFN::biases() const {
+    return biases_;
 }
 
 std::vector<Eigen::MatrixXd>& LTFN::mutable_weights() noexcept {
@@ -171,7 +241,33 @@ void LTFN::set_weights(const std::vector<Eigen::MatrixXd>& new_weights) {
     for (std::size_t l = 0; l < weights_.size(); ++l) {
         weight_velocities_[l] = Eigen::MatrixXd::Zero(weights_[l].rows(), weights_[l].cols());
     }
+    bias_velocities_.resize(biases_.size());
+    for (std::size_t l = 0; l < bias_velocities_.size(); ++l) {
+        bias_velocities_[l] = Eigen::VectorXd::Zero(biases_[l].size());
+    }
     layer_second_moments_.assign(weights_.size(), 0.0);
+    layer_error_second_moments_.assign(weights_.size(), 0.0);
+    layer_error_precisions_.assign(weights_.size(), 1.0);
+    visible_error_second_moments_.setZero();
+    visible_error_precisions_.setOnes();
+    predictions_dirty_ = true;
+}
+
+void LTFN::set_biases(const std::vector<Eigen::VectorXd>& new_biases) {
+    if (new_biases.size() != biases_.size()) {
+        throw std::invalid_argument("Bias count does not match the configured architecture.");
+    }
+    for (std::size_t l = 0; l < new_biases.size(); ++l) {
+        if (new_biases[l].size() != biases_[l].size()) {
+            throw std::invalid_argument("Checkpoint bias shape does not match the configured architecture.");
+        }
+    }
+
+    biases_ = new_biases;
+    bias_velocities_.resize(biases_.size());
+    for (std::size_t l = 0; l < bias_velocities_.size(); ++l) {
+        bias_velocities_[l] = Eigen::VectorXd::Zero(biases_[l].size());
+    }
     predictions_dirty_ = true;
 }
 
@@ -192,9 +288,7 @@ void LTFN::set_weight_momentum(double momentum_beta) {
 void LTFN::reset_states(const Eigen::VectorXd& input) {
     ensure_input_shape(input);
     states_[0] = input;
-    for (std::size_t l = 1; l < states_.size(); ++l) {
-        states_[l].setZero();
-    }
+    initialize_latent_states();
     compute_predictions_and_errors();
 }
 
@@ -207,35 +301,59 @@ void LTFN::advance(const Eigen::VectorXd& input, bool update_weights) {
 
 void LTFN::advance_current(bool update_weights) {
     ensure_predictions_current();
+    const auto precision_weighted_delta = [&](std::size_t layer) -> Eigen::VectorXd {
+        const Eigen::VectorXd delta = layer_delta_vec(
+            errors_[layer],
+            sigmoid_derivatives_[layer],
+            config_.visible_loss == VisibleLoss::Bce && layer == 0);
+        if (config_.visible_unit_precision && layer == 0) {
+            return delta.cwiseProduct(visible_error_precisions_).eval();
+        }
+        return (layer_error_precisions_[layer] * delta).eval();
+    };
     const double state_scale = config_.dt_r / config_.tau_r;
     const std::size_t top_index = states_.size() - 1;
 
-    {
-        const Eigen::VectorXd delta_top = errors_[top_index - 1].cwiseProduct(sigmoid_derivatives_[top_index - 1]);
-        states_[top_index] += (weights_[top_index - 1].transpose() * delta_top) * state_scale;
-    }
+    if (config_.sequential_inference) {
+        {
+            const Eigen::VectorXd delta_top = precision_weighted_delta(top_index - 1);
+            states_[top_index] += (weights_[top_index - 1].transpose() * delta_top) * state_scale;
+            compute_layer_prediction_error(top_index - 1);
+        }
 
-    for (std::size_t l = top_index - 1; l >= 1; --l) {
-        const bool use_bce_delta = config_.visible_loss == VisibleLoss::Bce && (l - 1) == 0;
-        const Eigen::VectorXd back =
-            weights_[l - 1].transpose() *
-            layer_delta_vec(errors_[l - 1], sigmoid_derivatives_[l - 1], use_bce_delta);
-        states_[l] -= state_scale * (errors_[l] - back);
-        if (l == 1) {
-            break;
+        for (std::size_t l = top_index - 1; l >= 1; --l) {
+            const Eigen::VectorXd back = weights_[l - 1].transpose() * precision_weighted_delta(l - 1);
+            states_[l] += state_scale * (back - (layer_error_precisions_[l] * errors_[l]));
+            compute_layer_prediction_error(l - 1);
+            if (l == 1) {
+                break;
+            }
+        }
+    } else {
+        {
+            const Eigen::VectorXd delta_top = precision_weighted_delta(top_index - 1);
+            states_[top_index] += (weights_[top_index - 1].transpose() * delta_top) * state_scale;
+        }
+
+        for (std::size_t l = top_index - 1; l >= 1; --l) {
+            const Eigen::VectorXd back = weights_[l - 1].transpose() * precision_weighted_delta(l - 1);
+            states_[l] -= state_scale * ((layer_error_precisions_[l] * errors_[l]) - back);
+            if (l == 1) {
+                break;
+            }
         }
     }
 
     if (update_weights) {
         predictions_dirty_ = true;
         compute_predictions_and_errors();
+        update_error_precisions_from_errors();
         const double weight_scale = current_learning_rate_ * config_.dt_w;
         for (std::size_t l = 0; l < errors_.size(); ++l) {
-            const bool use_bce_delta = config_.visible_loss == VisibleLoss::Bce && l == 0;
-            const Eigen::VectorXd delta_w =
-                layer_delta_vec(errors_[l], sigmoid_derivatives_[l], use_bce_delta);
+            const Eigen::VectorXd delta_w = precision_weighted_delta(l);
             const Eigen::MatrixXd gradient = delta_w * states_[l + 1].transpose();
             const Eigen::MatrixXd effective_gradient = gradient;
+            const Eigen::VectorXd bias_gradient = delta_w;
             double layer_scale = 1.0;
             if (config_.layer_adapt_beta > 0.0) {
                 const double next_second_moment = blend_second_moment(
@@ -246,12 +364,21 @@ void LTFN::advance_current(bool update_weights) {
                 layer_scale = 1.0 / (std::sqrt(std::max(0.0, next_second_moment)) + config_.layer_adapt_epsilon);
             }
             const Eigen::MatrixXd scaled_gradient = layer_scale * effective_gradient;
+            const Eigen::VectorXd scaled_bias_gradient = layer_scale * bias_gradient;
             if (momentum_beta_ > 0.0) {
                 weight_velocities_[l] *= momentum_beta_;
                 weight_velocities_[l].noalias() += weight_scale * scaled_gradient;
+                bias_velocities_[l] *= momentum_beta_;
+                bias_velocities_[l].noalias() += weight_scale * scaled_bias_gradient;
                 weights_[l] += weight_velocities_[l];
+                if (config_.use_biases) {
+                    biases_[l] += bias_velocities_[l];
+                }
             } else {
                 weights_[l].noalias() += weight_scale * scaled_gradient;
+                if (config_.use_biases) {
+                    biases_[l].noalias() += weight_scale * scaled_bias_gradient;
+                }
             }
         }
         predictions_dirty_ = true;
@@ -269,36 +396,67 @@ StepDiagnostics LTFN::step(const Eigen::VectorXd& input, bool update_weights) {
 
 StepDiagnostics LTFN::step_current(bool update_weights) {
     ensure_predictions_current();
-    std::vector<Eigen::VectorXd> next_states = states_;
+    const auto precision_weighted_delta = [&](std::size_t layer) -> Eigen::VectorXd {
+        const Eigen::VectorXd delta = layer_delta_vec(
+            errors_[layer],
+            sigmoid_derivatives_[layer],
+            config_.visible_loss == VisibleLoss::Bce && layer == 0);
+        if (config_.visible_unit_precision && layer == 0) {
+            return delta.cwiseProduct(visible_error_precisions_).eval();
+        }
+        return (layer_error_precisions_[layer] * delta).eval();
+    };
     std::vector<double> state_update_norms(weights_.size(), 0.0);
     const double state_scale = config_.dt_r / config_.tau_r;
     const std::size_t top_index = states_.size() - 1;
 
-    {
-        const Eigen::VectorXd delta_top = errors_[top_index - 1].cwiseProduct(sigmoid_derivatives_[top_index - 1]);
-        next_states[top_index] += (weights_[top_index - 1].transpose() * delta_top) * state_scale;
-    }
+    if (config_.sequential_inference) {
+        {
+            const Eigen::VectorXd delta_top = precision_weighted_delta(top_index - 1);
+            const Eigen::VectorXd update = (weights_[top_index - 1].transpose() * delta_top) * state_scale;
+            state_update_norms[top_index - 1] = update.norm();
+            states_[top_index] += update;
+            compute_layer_prediction_error(top_index - 1);
+        }
 
-    for (std::size_t l = top_index - 1; l >= 1; --l) {
-        const Eigen::VectorXd back =
-            weights_[l - 1].transpose() *
-            layer_delta_vec(
-                errors_[l - 1],
-                sigmoid_derivatives_[l - 1],
-                config_.visible_loss == VisibleLoss::Bce && (l - 1) == 0);
-        const Eigen::VectorXd grad = errors_[l] - back;
-        next_states[l] -= state_scale * grad;
-        if (l == 1) {
-            break;
+        for (std::size_t l = top_index - 1; l >= 1; --l) {
+            const Eigen::VectorXd back = weights_[l - 1].transpose() * precision_weighted_delta(l - 1);
+            const Eigen::VectorXd update =
+                state_scale * (back - (layer_error_precisions_[l] * errors_[l]));
+            state_update_norms[l - 1] = update.norm();
+            states_[l] += update;
+            compute_layer_prediction_error(l - 1);
+            if (l == 1) {
+                break;
+            }
+        }
+    } else {
+        std::vector<Eigen::VectorXd> next_states = states_;
+
+        {
+            const Eigen::VectorXd delta_top = precision_weighted_delta(top_index - 1);
+            next_states[top_index] += (weights_[top_index - 1].transpose() * delta_top) * state_scale;
+        }
+
+        for (std::size_t l = top_index - 1; l >= 1; --l) {
+            const Eigen::VectorXd back = weights_[l - 1].transpose() * precision_weighted_delta(l - 1);
+            const Eigen::VectorXd grad = (layer_error_precisions_[l] * errors_[l]) - back;
+            next_states[l] -= state_scale * grad;
+            if (l == 1) {
+                break;
+            }
+        }
+
+        for (std::size_t l = 1; l < states_.size(); ++l) {
+            state_update_norms[l - 1] = (next_states[l] - states_[l]).norm();
+            states_[l] = next_states[l];
         }
     }
 
-    for (std::size_t l = 1; l < states_.size(); ++l) {
-        state_update_norms[l - 1] = (next_states[l] - states_[l]).norm();
-        states_[l] = next_states[l];
-    }
-
     compute_predictions_and_errors();
+    if (update_weights) {
+        update_error_precisions_from_errors();
+    }
 
     StepDiagnostics diagnostics;
     diagnostics.error_norms.reserve(errors_.size());
@@ -310,13 +468,11 @@ StepDiagnostics LTFN::step_current(bool update_weights) {
     const double weight_scale = current_learning_rate_ * config_.dt_w;
     for (std::size_t l = 0; l < errors_.size(); ++l) {
         diagnostics.error_norms.push_back(errors_[l].norm());
-        const Eigen::VectorXd delta_w = layer_delta_vec(
-            errors_[l],
-            sigmoid_derivatives_[l],
-            config_.visible_loss == VisibleLoss::Bce && l == 0);
+        const Eigen::VectorXd delta_w = precision_weighted_delta(l);
         const Eigen::MatrixXd dW = delta_w * states_[l + 1].transpose();
         diagnostics.weight_gradient_norms.push_back(dW.norm());
         const Eigen::MatrixXd effective_gradient = dW;
+        const Eigen::VectorXd bias_gradient = delta_w;
         double layer_scale = 1.0;
         if (config_.layer_adapt_beta > 0.0) {
             const double next_second_moment = blend_second_moment(
@@ -329,15 +485,24 @@ StepDiagnostics LTFN::step_current(bool update_weights) {
             layer_scale = 1.0 / (std::sqrt(std::max(0.0, next_second_moment)) + config_.layer_adapt_epsilon);
         }
         const Eigen::MatrixXd scaled_gradient = layer_scale * effective_gradient;
+        const Eigen::VectorXd scaled_bias_gradient = layer_scale * bias_gradient;
         double update_norm = weight_scale * scaled_gradient.norm();
         if (update_weights) {
             if (momentum_beta_ > 0.0) {
                 weight_velocities_[l] *= momentum_beta_;
                 weight_velocities_[l].noalias() += weight_scale * scaled_gradient;
+                bias_velocities_[l] *= momentum_beta_;
+                bias_velocities_[l].noalias() += weight_scale * scaled_bias_gradient;
                 update_norm = weight_velocities_[l].norm();
                 weights_[l] += weight_velocities_[l];
+                if (config_.use_biases) {
+                    biases_[l] += bias_velocities_[l];
+                }
             } else {
                 weights_[l] += weight_scale * scaled_gradient;
+                if (config_.use_biases) {
+                    biases_[l].noalias() += weight_scale * scaled_bias_gradient;
+                }
             }
         } else if (momentum_beta_ > 0.0) {
             const Eigen::MatrixXd tentative_update =
@@ -359,6 +524,16 @@ StepDiagnostics LTFN::step_current(bool update_weights) {
 
 StepDiagnostics LTFN::current_diagnostics() const {
     ensure_predictions_current();
+    const auto precision_weighted_delta = [&](std::size_t layer) -> Eigen::VectorXd {
+        const Eigen::VectorXd delta = layer_delta_vec(
+            errors_[layer],
+            sigmoid_derivatives_[layer],
+            config_.visible_loss == VisibleLoss::Bce && layer == 0);
+        if (config_.visible_unit_precision && layer == 0) {
+            return delta.cwiseProduct(visible_error_precisions_).eval();
+        }
+        return (layer_error_precisions_[layer] * delta).eval();
+    };
     StepDiagnostics diagnostics;
     diagnostics.error_norms.reserve(errors_.size());
     diagnostics.state_update_norms.assign(weights_.size(), 0.0);
@@ -370,10 +545,7 @@ StepDiagnostics LTFN::current_diagnostics() const {
     for (std::size_t l = 0; l < errors_.size(); ++l) {
         const double error_norm = errors_[l].norm();
         diagnostics.error_norms.push_back(error_norm);
-        const Eigen::VectorXd delta_w = layer_delta_vec(
-            errors_[l],
-            sigmoid_derivatives_[l],
-            config_.visible_loss == VisibleLoss::Bce && l == 0);
+        const Eigen::VectorXd delta_w = precision_weighted_delta(l);
         const Eigen::MatrixXd dW = delta_w * states_[l + 1].transpose();
         diagnostics.weight_gradient_norms.push_back(dW.norm());
         const Eigen::MatrixXd effective_gradient = dW;
@@ -395,9 +567,14 @@ StepDiagnostics LTFN::current_diagnostics() const {
         }
         diagnostics.weight_norms.push_back(weights_[l].norm());
         if (config_.visible_loss == VisibleLoss::Bce && l == 0) {
-            diagnostics.energy += binary_cross_entropy_energy(states_[0], predictions_[0]);
+            diagnostics.energy += config_.visible_unit_precision
+                ? weighted_binary_cross_entropy_energy(states_[0], predictions_[0], visible_error_precisions_)
+                : layer_error_precisions_[l] * binary_cross_entropy_energy(states_[0], predictions_[0]);
+        } else if (config_.visible_unit_precision && l == 0) {
+            diagnostics.energy +=
+                0.5 * (visible_error_precisions_.array() * errors_[0].array().square()).sum();
         } else {
-            diagnostics.energy += 0.5 * error_norm * error_norm;
+            diagnostics.energy += layer_error_precisions_[l] * 0.5 * error_norm * error_norm;
         }
     }
     diagnostics.mse = static_cast<double>(config_.dims.front()) > 0
@@ -457,17 +634,85 @@ BatchTrainResult LTFN::train_batch(
         batch_states[0].col(static_cast<Eigen::Index>(index)) = *inputs[index];
     }
 
+    if (config_.state_init == StateInit::Tied) {
+        for (std::size_t l = 1; l < state_count; ++l) {
+            batch_states[l].noalias() = weights_[l - 1].transpose() * batch_states[l - 1];
+            batch_states[l] = sigmoid_matrix(batch_states[l]);
+        }
+    }
+
+    auto compute_batch_layer_error_and_delta = [&](std::size_t layer) {
+        batch_pre_activations[layer].noalias() = weights_[layer] * batch_states[layer + 1];
+        if (config_.use_biases) {
+            batch_pre_activations[layer].colwise() += biases_[layer];
+        }
+        const Eigen::MatrixXd sigma = sigmoid_matrix(batch_pre_activations[layer]);
+        batch_errors[layer] = batch_states[layer] - sigma;
+        if (config_.visible_loss == VisibleLoss::Bce && layer == 0) {
+            batch_deltas[layer] = batch_errors[layer];
+        } else {
+            batch_deltas[layer] =
+                (batch_errors[layer].array() * sigma.array() * (1.0 - sigma.array())).matrix();
+        }
+        if (config_.visible_unit_precision && layer == 0) {
+            batch_deltas[layer].array().colwise() *= visible_error_precisions_.array();
+        }
+    };
+
     auto compute_batch_errors_and_deltas = [&]() {
         for (std::size_t l = 0; l < layer_count; ++l) {
-            batch_pre_activations[l].noalias() = weights_[l] * batch_states[l + 1];
-            const Eigen::ArrayXXd clipped = batch_pre_activations[l].array().max(-500.0).min(500.0);
-            const Eigen::ArrayXXd sigma = 1.0 / (1.0 + (-clipped).exp());
-            batch_errors[l] = batch_states[l] - sigma.matrix();
-            if (config_.visible_loss == VisibleLoss::Bce && l == 0) {
-                batch_deltas[l] = batch_errors[l];
-            } else {
-                batch_deltas[l] = (batch_errors[l].array() * sigma * (1.0 - sigma)).matrix();
-            }
+            compute_batch_layer_error_and_delta(l);
+        }
+    };
+
+    auto update_error_precisions_from_batch_errors = [&]() {
+        if (config_.error_precision_beta <= 0.0) {
+            return;
+        }
+
+        std::size_t start_layer = 0;
+        if (config_.visible_unit_precision) {
+            const Eigen::ArrayXd mean_square = batch_errors[0].array().square().rowwise().mean();
+            visible_error_second_moments_ =
+                (config_.error_precision_beta * visible_error_second_moments_.array() +
+                    (1.0 - config_.error_precision_beta) * mean_square)
+                    .matrix();
+            visible_error_precisions_ =
+                (1.0 / (visible_error_second_moments_.array().max(0.0).sqrt() + config_.error_precision_epsilon)).matrix();
+            normalize_precision_vector(
+                visible_error_precisions_,
+                config_.error_precision_min,
+                config_.error_precision_max);
+            layer_error_precisions_[0] = 1.0;
+            start_layer = 1;
+        }
+
+        for (std::size_t l = start_layer; l < layer_count; ++l) {
+            const double mean_square =
+                batch_errors[l].squaredNorm() /
+                static_cast<double>(batch_errors[l].rows() * batch_errors[l].cols());
+            const double next_second_moment = blend_second_moment(
+                layer_error_second_moments_[l],
+                config_.error_precision_beta,
+                mean_square);
+            layer_error_second_moments_[l] = next_second_moment;
+            layer_error_precisions_[l] =
+                1.0 / (std::sqrt(std::max(0.0, next_second_moment)) + config_.error_precision_epsilon);
+        }
+        if (start_layer == 0) {
+            normalize_precision_vector(
+                layer_error_precisions_,
+                config_.error_precision_min,
+                config_.error_precision_max);
+        } else if (layer_count > 1) {
+            std::vector<double> hidden_precisions(
+                layer_error_precisions_.begin() + 1,
+                layer_error_precisions_.end());
+            normalize_precision_vector(
+                hidden_precisions,
+                config_.error_precision_min,
+                config_.error_precision_max);
+            std::copy(hidden_precisions.begin(), hidden_precisions.end(), layer_error_precisions_.begin() + 1);
         }
     };
 
@@ -486,10 +731,20 @@ BatchTrainResult LTFN::train_batch(
             const double error_norm = batch_errors[l].norm() * batch_norm_scale;
             diagnostics.error_norms.push_back(error_norm);
             if (config_.visible_loss == VisibleLoss::Bce && l == 0) {
-                diagnostics.energy += binary_cross_entropy_energy(batch_states[0], batch_states[0] - batch_errors[0]) *
+                diagnostics.energy += config_.visible_unit_precision
+                    ? weighted_binary_cross_entropy_energy(
+                        batch_states[0],
+                        batch_states[0] - batch_errors[0],
+                        visible_error_precisions_) * batch_scale
+                    : layer_error_precisions_[l] *
+                        binary_cross_entropy_energy(batch_states[0], batch_states[0] - batch_errors[0]) * batch_scale;
+            } else if (config_.visible_unit_precision && l == 0) {
+                diagnostics.energy += 0.5 *
+                    (batch_errors[0].array().square().colwise() * visible_error_precisions_.array()).sum() *
                     batch_scale;
             } else {
-                diagnostics.energy += 0.5 * batch_errors[l].squaredNorm() * batch_scale;
+                diagnostics.energy +=
+                    layer_error_precisions_[l] * 0.5 * batch_errors[l].squaredNorm() * batch_scale;
             }
 
             double gradient_norm = 0.0;
@@ -497,14 +752,15 @@ BatchTrainResult LTFN::train_batch(
             if (gradient_norms_override != nullptr) {
                 gradient_norm = (*gradient_norms_override)[l];
             } else {
-                Eigen::MatrixXd gradient = batch_deltas[l] * batch_states[l + 1].transpose();
+                Eigen::MatrixXd gradient =
+                    (layer_error_precisions_[l] * batch_deltas[l]) * batch_states[l + 1].transpose();
                 gradient *= batch_scale;
                 Eigen::MatrixXd effective_gradient = gradient;
                 if (config_.decorrelation_lambda > 0.0 && batch_size > 1) {
                     const Eigen::MatrixXd decor_signal = compute_decorrelation_signal(batch_states[l + 1]);
                     effective_gradient.noalias() -=
                         config_.decorrelation_lambda *
-                        (batch_deltas[l] * decor_signal.transpose() * batch_scale);
+                        ((layer_error_precisions_[l] * batch_deltas[l]) * decor_signal.transpose() * batch_scale);
                 }
                 gradient_norm = effective_gradient.norm();
                 if (update_norms_override == nullptr) {
@@ -552,6 +808,9 @@ BatchTrainResult LTFN::train_batch(
     }
 
     compute_batch_errors_and_deltas();
+    if (options.update_weights) {
+        update_error_precisions_from_batch_errors();
+    }
 
     auto maybe_log_step =
         [&](int relax_step,
@@ -576,42 +835,81 @@ BatchTrainResult LTFN::train_batch(
     if (options.capture_final_gradients) {
         last_gradients.resize(layer_count);
         for (std::size_t l = 0; l < layer_count; ++l) {
-            last_gradients[l] = batch_deltas[l] * batch_states[l + 1].transpose() * batch_scale;
+            last_gradients[l] =
+                (layer_error_precisions_[l] * batch_deltas[l]) * batch_states[l + 1].transpose() * batch_scale;
         }
     }
     for (int relax_step = 1; relax_step <= steps; ++relax_step) {
         std::vector<double> state_update_norms(layer_count, 0.0);
+        const double step_gate = config_.transient_gate_tau > 0.0
+            ? (1.0 - std::exp(-static_cast<double>(relax_step) / config_.transient_gate_tau))
+            : 1.0;
         const std::size_t top_index = state_count - 1;
 
-        {
-            const Eigen::MatrixXd top_update =
-                state_scale * (weights_[top_index - 1].transpose() * batch_deltas[top_index - 1]);
-            state_update_norms[top_index - 1] = top_update.norm() * batch_norm_scale;
-            batch_states[top_index] += top_update;
-        }
+        if (config_.sequential_inference) {
+            {
+                const Eigen::MatrixXd top_update =
+                    state_scale *
+                    (weights_[top_index - 1].transpose() *
+                     (layer_error_precisions_[top_index - 1] * batch_deltas[top_index - 1]));
+                state_update_norms[top_index - 1] = top_update.norm() * batch_norm_scale;
+                batch_states[top_index] += top_update;
+                compute_batch_layer_error_and_delta(top_index - 1);
+            }
 
-        for (std::size_t l = top_index - 1; l >= 1; --l) {
-            const Eigen::MatrixXd back = weights_[l - 1].transpose() * batch_deltas[l - 1];
-            const Eigen::MatrixXd update = state_scale * (back - batch_errors[l]);
-            state_update_norms[l - 1] = update.norm() * batch_norm_scale;
-            batch_states[l] += update;
-            if (l == 1) {
-                break;
+            for (std::size_t l = top_index - 1; l >= 1; --l) {
+                const Eigen::MatrixXd back =
+                    weights_[l - 1].transpose() * (layer_error_precisions_[l - 1] * batch_deltas[l - 1]);
+                const Eigen::MatrixXd update =
+                    state_scale * (back - (layer_error_precisions_[l] * batch_errors[l]));
+                state_update_norms[l - 1] = update.norm() * batch_norm_scale;
+                batch_states[l] += update;
+                compute_batch_layer_error_and_delta(l - 1);
+                if (l == 1) {
+                    break;
+                }
+            }
+        } else {
+            {
+                const Eigen::MatrixXd top_update =
+                    state_scale *
+                    (weights_[top_index - 1].transpose() *
+                     (layer_error_precisions_[top_index - 1] * batch_deltas[top_index - 1]));
+                state_update_norms[top_index - 1] = top_update.norm() * batch_norm_scale;
+                batch_states[top_index] += top_update;
+            }
+
+            for (std::size_t l = top_index - 1; l >= 1; --l) {
+                const Eigen::MatrixXd back =
+                    weights_[l - 1].transpose() * (layer_error_precisions_[l - 1] * batch_deltas[l - 1]);
+                const Eigen::MatrixXd update =
+                    state_scale * (back - (layer_error_precisions_[l] * batch_errors[l]));
+                state_update_norms[l - 1] = update.norm() * batch_norm_scale;
+                batch_states[l] += update;
+                if (l == 1) {
+                    break;
+                }
             }
         }
 
         compute_batch_errors_and_deltas();
+        if (options.update_weights) {
+            update_error_precisions_from_batch_errors();
+        }
         std::vector<double> gradient_norms(layer_count, 0.0);
         std::vector<double> update_norms(layer_count, 0.0);
         for (std::size_t l = 0; l < layer_count; ++l) {
-            const Eigen::MatrixXd gradient = batch_deltas[l] * batch_states[l + 1].transpose() * batch_scale;
+            const Eigen::MatrixXd gradient =
+                (layer_error_precisions_[l] * batch_deltas[l]) * batch_states[l + 1].transpose() * batch_scale;
             Eigen::MatrixXd effective_gradient = gradient;
             if (config_.decorrelation_lambda > 0.0 && batch_size > 1) {
                 const Eigen::MatrixXd decor_signal = compute_decorrelation_signal(batch_states[l + 1]);
                 effective_gradient.noalias() -=
                     config_.decorrelation_lambda *
-                    (batch_deltas[l] * decor_signal.transpose() * batch_scale);
+                    ((layer_error_precisions_[l] * batch_deltas[l]) * decor_signal.transpose() * batch_scale);
             }
+            const Eigen::VectorXd bias_gradient =
+                layer_error_precisions_[l] * batch_deltas[l].rowwise().mean();
             gradient_norms[l] = effective_gradient.norm();
             if (options.capture_final_gradients) {
                 last_gradients[l] = effective_gradient;
@@ -628,15 +926,25 @@ BatchTrainResult LTFN::train_batch(
                 layer_scale = 1.0 / (std::sqrt(std::max(0.0, next_second_moment)) + config_.layer_adapt_epsilon);
             }
             const Eigen::MatrixXd scaled_gradient = layer_scale * effective_gradient;
+            const Eigen::VectorXd scaled_bias_gradient = layer_scale * bias_gradient;
             if (options.update_weights) {
+                const double gated_weight_scale = weight_scale * step_gate;
                 if (momentum_beta_ > 0.0) {
                     weight_velocities_[l] *= momentum_beta_;
-                    weight_velocities_[l].noalias() += weight_scale * scaled_gradient;
+                    weight_velocities_[l].noalias() += gated_weight_scale * scaled_gradient;
+                    bias_velocities_[l] *= momentum_beta_;
+                    bias_velocities_[l].noalias() += gated_weight_scale * scaled_bias_gradient;
                     update_norms[l] = weight_velocities_[l].norm();
                     weights_[l] += weight_velocities_[l];
+                    if (config_.use_biases) {
+                        biases_[l] += bias_velocities_[l];
+                    }
                 } else {
-                    update_norms[l] = weight_scale * scaled_gradient.norm();
-                    weights_[l] += weight_scale * scaled_gradient;
+                    update_norms[l] = gated_weight_scale * scaled_gradient.norm();
+                    weights_[l] += gated_weight_scale * scaled_gradient;
+                    if (config_.use_biases) {
+                        biases_[l].noalias() += gated_weight_scale * scaled_bias_gradient;
+                    }
                 }
             } else if (momentum_beta_ > 0.0) {
                 const Eigen::MatrixXd tentative_update =
@@ -736,9 +1044,13 @@ double LTFN::current_energy() const noexcept {
     double energy = 0.0;
     for (std::size_t l = 0; l < errors_.size(); ++l) {
         if (config_.visible_loss == VisibleLoss::Bce && l == 0) {
-            energy += binary_cross_entropy_energy(states_[0], predictions_[0]);
+            energy += config_.visible_unit_precision
+                ? weighted_binary_cross_entropy_energy(states_[0], predictions_[0], visible_error_precisions_)
+                : layer_error_precisions_[l] * binary_cross_entropy_energy(states_[0], predictions_[0]);
+        } else if (config_.visible_unit_precision && l == 0) {
+            energy += 0.5 * (visible_error_precisions_.array() * errors_[0].array().square()).sum();
         } else {
-            energy += 0.5 * errors_[l].squaredNorm();
+            energy += layer_error_precisions_[l] * 0.5 * errors_[l].squaredNorm();
         }
     }
     return energy;
@@ -769,16 +1081,45 @@ void LTFN::validate_dims() const {
     if (config_.tau_r <= 0.0) {
         throw std::invalid_argument("tau_r must be positive.");
     }
+    if (config_.error_precision_beta < 0.0 || config_.error_precision_beta >= 1.0) {
+        throw std::invalid_argument("error_precision_beta must be in [0, 1).");
+    }
+    if (config_.error_precision_epsilon <= 0.0) {
+        throw std::invalid_argument("error_precision_epsilon must be positive.");
+    }
+    if (config_.error_precision_min <= 0.0 || config_.error_precision_max < config_.error_precision_min) {
+        throw std::invalid_argument("Error precision clamp bounds are invalid.");
+    }
+}
+
+void LTFN::initialize_latent_states() {
+    if (config_.state_init == StateInit::Zero) {
+        for (std::size_t l = 1; l < states_.size(); ++l) {
+            states_[l].setZero();
+        }
+        return;
+    }
+
+    for (std::size_t l = 1; l < states_.size(); ++l) {
+        states_[l] = sigmoid_vec(weights_[l - 1].transpose() * states_[l - 1]);
+    }
 }
 
 void LTFN::compute_predictions_and_errors() const {
     for (std::size_t l = 0; l < weights_.size(); ++l) {
-        pre_activations_[l].noalias() = weights_[l] * states_[l + 1];
-        predictions_[l] = sigmoid_vec(pre_activations_[l]);
-        sigmoid_derivatives_[l] = sigmoid_derivative_vec(pre_activations_[l]);
-        errors_[l] = states_[l] - predictions_[l];
+        compute_layer_prediction_error(l);
     }
     predictions_dirty_ = false;
+}
+
+void LTFN::compute_layer_prediction_error(std::size_t layer) const {
+    pre_activations_[layer].noalias() = weights_[layer] * states_[layer + 1];
+    if (config_.use_biases) {
+        pre_activations_[layer] += biases_[layer];
+    }
+    predictions_[layer] = sigmoid_vec(pre_activations_[layer]);
+    sigmoid_derivatives_[layer] = sigmoid_derivative_vec(pre_activations_[layer]);
+    errors_[layer] = states_[layer] - predictions_[layer];
 }
 
 void LTFN::ensure_predictions_current() const {
@@ -790,6 +1131,55 @@ void LTFN::ensure_predictions_current() const {
 void LTFN::ensure_input_shape(const Eigen::VectorXd& input) const {
     if (input.size() != config_.dims.front()) {
         throw std::invalid_argument("Input dimension does not match the configured visible layer.");
+    }
+}
+
+void LTFN::update_error_precisions_from_errors() {
+    if (config_.error_precision_beta <= 0.0) {
+        return;
+    }
+
+    std::size_t start_layer = 0;
+    if (config_.visible_unit_precision) {
+        const Eigen::ArrayXd mean_square = errors_[0].array().square();
+        visible_error_second_moments_ =
+            (config_.error_precision_beta * visible_error_second_moments_.array() +
+                (1.0 - config_.error_precision_beta) * mean_square)
+                .matrix();
+        visible_error_precisions_ =
+            (1.0 / (visible_error_second_moments_.array().max(0.0).sqrt() + config_.error_precision_epsilon)).matrix();
+        normalize_precision_vector(
+            visible_error_precisions_,
+            config_.error_precision_min,
+            config_.error_precision_max);
+        layer_error_precisions_[0] = 1.0;
+        start_layer = 1;
+    }
+
+    for (std::size_t l = start_layer; l < errors_.size(); ++l) {
+        const double mean_square = errors_[l].squaredNorm() / static_cast<double>(errors_[l].size());
+        const double next_second_moment = blend_second_moment(
+            layer_error_second_moments_[l],
+            config_.error_precision_beta,
+            mean_square);
+        layer_error_second_moments_[l] = next_second_moment;
+        layer_error_precisions_[l] =
+            1.0 / (std::sqrt(std::max(0.0, next_second_moment)) + config_.error_precision_epsilon);
+    }
+    if (start_layer == 0) {
+        normalize_precision_vector(
+            layer_error_precisions_,
+            config_.error_precision_min,
+            config_.error_precision_max);
+    } else if (layer_error_precisions_.size() > 1) {
+        std::vector<double> hidden_precisions(
+            layer_error_precisions_.begin() + 1,
+            layer_error_precisions_.end());
+        normalize_precision_vector(
+            hidden_precisions,
+            config_.error_precision_min,
+            config_.error_precision_max);
+        std::copy(hidden_precisions.begin(), hidden_precisions.end(), layer_error_precisions_.begin() + 1);
     }
 }
 

@@ -32,6 +32,15 @@ struct ExperimentConfig {
     double dt_r{0.1};
     double dt_w{1.0};
     VisibleLoss visible_loss{VisibleLoss::Mse};
+    bool use_biases{false};
+    bool visible_unit_precision{false};
+    StateInit state_init{StateInit::Zero};
+    double error_precision_beta{0.0};
+    double error_precision_epsilon{1e-4};
+    double error_precision_min{0.25};
+    double error_precision_max{4.0};
+    double transient_gate_tau{0.0};
+    bool sequential_inference{false};
     double momentum_beta{0.0};
     double layer_adapt_beta{0.0};
     double layer_adapt_epsilon{1e-8};

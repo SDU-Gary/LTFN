@@ -21,7 +21,7 @@ namespace ltfn {
 namespace {
 
 constexpr std::array<char, 8> kCheckpointMagic{'L', 'T', 'F', 'N', 'C', 'K', 'P', '1'};
-constexpr std::uint32_t kCheckpointVersion = 1U;
+constexpr std::uint32_t kCheckpointVersion = 2U;
 
 std::uint32_t read_big_endian_u32(std::istream& stream) {
     std::array<unsigned char, 4> bytes{};
@@ -159,6 +159,16 @@ VisibleLoss parse_visible_loss(const std::string& value) {
     throw std::invalid_argument("Unknown visible loss: " + value);
 }
 
+StateInit parse_state_init(const std::string& value) {
+    if (value == "zero") {
+        return StateInit::Zero;
+    }
+    if (value == "tied") {
+        return StateInit::Tied;
+    }
+    throw std::invalid_argument("Unknown state initialization mode: " + value);
+}
+
 std::vector<int> parse_dims(const std::string& value) {
     std::vector<int> dims;
     std::stringstream stream(value);
@@ -200,6 +210,15 @@ std::string config_to_json(const ExperimentConfig& config, int argc, char** argv
            << "  \"dt_r\": " << config.dt_r << ",\n"
            << "  \"dt_w\": " << config.dt_w << ",\n"
            << "  \"visible_loss\": \"" << visible_loss_to_string(config.visible_loss) << "\",\n"
+           << "  \"use_biases\": " << bool_to_json(config.use_biases) << ",\n"
+           << "  \"visible_unit_precision\": " << bool_to_json(config.visible_unit_precision) << ",\n"
+           << "  \"state_init\": \"" << state_init_to_string(config.state_init) << "\",\n"
+           << "  \"error_precision_beta\": " << config.error_precision_beta << ",\n"
+           << "  \"error_precision_epsilon\": " << config.error_precision_epsilon << ",\n"
+           << "  \"error_precision_min\": " << config.error_precision_min << ",\n"
+           << "  \"error_precision_max\": " << config.error_precision_max << ",\n"
+           << "  \"transient_gate_tau\": " << config.transient_gate_tau << ",\n"
+           << "  \"sequential_inference\": " << bool_to_json(config.sequential_inference) << ",\n"
            << "  \"momentum_beta\": " << config.momentum_beta << ",\n"
            << "  \"layer_adapt_beta\": " << config.layer_adapt_beta << ",\n"
            << "  \"layer_adapt_epsilon\": " << config.layer_adapt_epsilon << ",\n"
@@ -312,6 +331,45 @@ bool parse_args(int argc, char** argv, ExperimentConfig& config, std::string& er
             } else if (key == "--visible-loss") {
                 append_argument_value(i, argc, argv, value, key);
                 config.visible_loss = parse_visible_loss(value);
+            } else if (key == "--use-biases") {
+                append_argument_value(i, argc, argv, value, key);
+                bool use_biases = config.use_biases;
+                if (!parse_bool_string(value, use_biases)) {
+                    throw std::invalid_argument("Expected boolean for --use-biases, got: " + value);
+                }
+                config.use_biases = use_biases;
+            } else if (key == "--visible-unit-precision") {
+                append_argument_value(i, argc, argv, value, key);
+                bool visible_unit_precision = config.visible_unit_precision;
+                if (!parse_bool_string(value, visible_unit_precision)) {
+                    throw std::invalid_argument("Expected boolean for --visible-unit-precision, got: " + value);
+                }
+                config.visible_unit_precision = visible_unit_precision;
+            } else if (key == "--state-init") {
+                append_argument_value(i, argc, argv, value, key);
+                config.state_init = parse_state_init(value);
+            } else if (key == "--error-precision-beta") {
+                append_argument_value(i, argc, argv, value, key);
+                config.error_precision_beta = std::stod(value);
+            } else if (key == "--error-precision-eps") {
+                append_argument_value(i, argc, argv, value, key);
+                config.error_precision_epsilon = std::stod(value);
+            } else if (key == "--error-precision-min") {
+                append_argument_value(i, argc, argv, value, key);
+                config.error_precision_min = std::stod(value);
+            } else if (key == "--error-precision-max") {
+                append_argument_value(i, argc, argv, value, key);
+                config.error_precision_max = std::stod(value);
+            } else if (key == "--transient-gate-tau") {
+                append_argument_value(i, argc, argv, value, key);
+                config.transient_gate_tau = std::stod(value);
+            } else if (key == "--sequential-inference") {
+                append_argument_value(i, argc, argv, value, key);
+                bool sequential_inference = config.sequential_inference;
+                if (!parse_bool_string(value, sequential_inference)) {
+                    throw std::invalid_argument("Expected boolean for --sequential-inference, got: " + value);
+                }
+                config.sequential_inference = sequential_inference;
             } else if (key == "--momentum-beta") {
                 append_argument_value(i, argc, argv, value, key);
                 config.momentum_beta = std::stod(value);
@@ -394,6 +452,21 @@ bool parse_args(int argc, char** argv, ExperimentConfig& config, std::string& er
         if (config.lr_w_final < 0.0) {
             throw std::invalid_argument("--lr-final must be non-negative.");
         }
+        if (config.error_precision_beta < 0.0 || config.error_precision_beta >= 1.0) {
+            throw std::invalid_argument("--error-precision-beta must be in [0, 1).");
+        }
+        if (config.error_precision_epsilon <= 0.0) {
+            throw std::invalid_argument("--error-precision-eps must be positive.");
+        }
+        if (config.error_precision_min <= 0.0) {
+            throw std::invalid_argument("--error-precision-min must be positive.");
+        }
+        if (config.error_precision_max < config.error_precision_min) {
+            throw std::invalid_argument("--error-precision-max must be >= --error-precision-min.");
+        }
+        if (config.transient_gate_tau < 0.0) {
+            throw std::invalid_argument("--transient-gate-tau must be non-negative.");
+        }
         if (config.momentum_beta < 0.0 || config.momentum_beta >= 1.0) {
             throw std::invalid_argument("--momentum-beta must be in [0, 1).");
         }
@@ -447,6 +520,18 @@ std::string usage_text(const char* program_name) {
         << "  --dt-r FLOAT                    State step size (default: 0.1)\n"
         << "  --dt-w FLOAT                    Weight step size (default: 1.0)\n"
         << "  --visible-loss mse|bce          Visible-layer energy term (default: mse)\n"
+        << "  --use-biases true|false         Enable learnable generative biases (default: false)\n"
+        << "  --visible-unit-precision        true|false, use per-pixel visible precisions (default: false)\n"
+        << "  --state-init zero|tied          Latent state initialization mode (default: zero)\n"
+        << "  --error-precision-beta FLOAT    EMA beta for layerwise error precisions, 0 disables\n"
+        << "                                  (default: 0.0)\n"
+        << "  --error-precision-eps FLOAT     Epsilon for layerwise error precisions (default: 1e-4)\n"
+        << "  --error-precision-min FLOAT     Minimum layerwise error precision (default: 0.25)\n"
+        << "  --error-precision-max FLOAT     Maximum layerwise error precision (default: 4.0)\n"
+        << "  --transient-gate-tau FLOAT      Exponential plasticity warmup in relax steps, 0 disables\n"
+        << "                                  (default: 0.0)\n"
+        << "  --sequential-inference          true|false, refresh lower-layer errors after each state update\n"
+        << "                                  (default: false)\n"
         << "  --momentum-beta FLOAT           SGD momentum beta in [0,1) (default: 0.0)\n"
         << "  --layer-adapt-beta FLOAT        Per-layer RMS gradient EMA beta, 0 disables (default: 0.0)\n"
         << "  --layer-adapt-eps FLOAT         Epsilon for layer-adaptive scaling (default: 1e-8)\n"
@@ -766,6 +851,8 @@ bool save_checkpoint(
         write_pod(stream, config.lr_w);
         write_pod(stream, config.dt_r);
         write_pod(stream, config.dt_w);
+        const std::uint8_t use_biases = config.use_biases ? 1U : 0U;
+        write_pod(stream, use_biases);
         write_pod(stream, state.samples_seen);
         write_pod(stream, state.epochs_completed);
         write_pod(stream, state.seed);
@@ -779,6 +866,15 @@ bool save_checkpoint(
             write_pod(stream, rows);
             write_pod(stream, cols);
             write_binary(stream, weight.data(), sizeof(double) * static_cast<std::size_t>(rows * cols));
+        }
+
+        const auto& biases = model.biases();
+        const std::uint32_t bias_count = static_cast<std::uint32_t>(biases.size());
+        write_pod(stream, bias_count);
+        for (const auto& bias : biases) {
+            const std::int32_t size = static_cast<std::int32_t>(bias.size());
+            write_pod(stream, size);
+            write_binary(stream, bias.data(), sizeof(double) * static_cast<std::size_t>(size));
         }
 
         if (!stream) {
@@ -828,10 +924,16 @@ bool load_checkpoint(
         double lr_w = 0.0;
         double dt_r = 0.0;
         double dt_w = 0.0;
+        bool checkpoint_uses_biases = false;
         read_pod(stream, tau_r);
         read_pod(stream, lr_w);
         read_pod(stream, dt_r);
         read_pod(stream, dt_w);
+        if (version >= 2U) {
+            std::uint8_t encoded_use_biases = 0U;
+            read_pod(stream, encoded_use_biases);
+            checkpoint_uses_biases = encoded_use_biases != 0U;
+        }
         read_pod(stream, state.samples_seen);
         read_pod(stream, state.epochs_completed);
         read_pod(stream, state.seed);
@@ -841,7 +943,8 @@ bool load_checkpoint(
             std::abs(tau_r - config.tau_r) > 1e-12 ||
             std::abs(lr_w - config.lr_w) > 1e-12 ||
             std::abs(dt_r - config.dt_r) > 1e-12 ||
-            std::abs(dt_w - config.dt_w) > 1e-12) {
+            std::abs(dt_w - config.dt_w) > 1e-12 ||
+            (checkpoint_uses_biases && !config.use_biases)) {
             throw std::runtime_error("Checkpoint configuration does not match the current model.");
         }
 
@@ -864,6 +967,23 @@ bool load_checkpoint(
         }
 
         model.set_weights(weights);
+        if (version >= 2U) {
+            std::uint32_t bias_count = 0U;
+            read_pod(stream, bias_count);
+            std::vector<Eigen::VectorXd> biases;
+            biases.reserve(bias_count);
+            for (std::uint32_t i = 0; i < bias_count; ++i) {
+                std::int32_t size = 0;
+                read_pod(stream, size);
+                Eigen::VectorXd bias(size);
+                stream.read(reinterpret_cast<char*>(bias.data()), sizeof(double) * static_cast<std::size_t>(size));
+                if (!stream) {
+                    throw std::runtime_error("Failed while reading checkpoint biases.");
+                }
+                biases.push_back(std::move(bias));
+            }
+            model.set_biases(biases);
+        }
         return true;
     } catch (const std::exception& ex) {
         error_message = ex.what();
