@@ -1010,9 +1010,25 @@ RelaxationResult LTFN::relax(const Eigen::VectorXd& input, int steps, bool captu
 RelaxationResult LTFN::reconstruct(const Eigen::VectorXd& input, int steps, bool capture_trace) {
     reset_states(input);
 
+    const bool adapt_inference_precisions = config_.error_precision_beta > 0.0;
+    const std::vector<double> saved_layer_error_second_moments = layer_error_second_moments_;
+    const std::vector<double> saved_layer_error_precisions = layer_error_precisions_;
+    const Eigen::VectorXd saved_visible_error_second_moments = visible_error_second_moments_;
+    const Eigen::VectorXd saved_visible_error_precisions = visible_error_precisions_;
+    const auto restore_precision_state = [&]() {
+        layer_error_second_moments_ = saved_layer_error_second_moments;
+        layer_error_precisions_ = saved_layer_error_precisions;
+        visible_error_second_moments_ = saved_visible_error_second_moments;
+        visible_error_precisions_ = saved_visible_error_precisions;
+    };
+
     RelaxationResult result;
     if (capture_trace) {
         result.energy_trace.reserve(static_cast<std::size_t>(std::max(steps, 0)));
+    }
+
+    if (adapt_inference_precisions) {
+        update_error_precisions_from_errors();
     }
 
     StepDiagnostics diagnostics;
@@ -1022,13 +1038,25 @@ RelaxationResult LTFN::reconstruct(const Eigen::VectorXd& input, int steps, bool
     if (capture_trace) {
         for (int t = 0; t < steps; ++t) {
             diagnostics = step_current(false);
+            if (adapt_inference_precisions) {
+                update_error_precisions_from_errors();
+                diagnostics = current_diagnostics();
+            }
             result.energy_trace.push_back(diagnostics.energy);
         }
     } else if (steps > 0) {
         for (int t = 1; t < steps; ++t) {
             advance_current(false);
+            if (adapt_inference_precisions) {
+                ensure_predictions_current();
+                update_error_precisions_from_errors();
+            }
         }
         diagnostics = step_current(false);
+        if (adapt_inference_precisions) {
+            update_error_precisions_from_errors();
+            diagnostics = current_diagnostics();
+        }
     }
 
     result.reconstruction = current_reconstruction();
@@ -1036,6 +1064,7 @@ RelaxationResult LTFN::reconstruct(const Eigen::VectorXd& input, int steps, bool
     result.mse = ltfn::compute_mse(input, result.reconstruction);
     result.final_error_norms = diagnostics.error_norms;
     result.final_weight_gradient_norms = diagnostics.weight_gradient_norms;
+    restore_precision_state();
     return result;
 }
 

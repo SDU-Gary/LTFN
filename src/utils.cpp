@@ -906,7 +906,7 @@ bool load_checkpoint(
 
         std::uint32_t version = 0U;
         read_pod(stream, version);
-        if (version != kCheckpointVersion) {
+        if (version != 1U && version != kCheckpointVersion) {
             throw std::runtime_error("Unsupported checkpoint version.");
         }
 
