@@ -125,6 +125,27 @@ add_executable(ltfn_h4_sequence
 
 target_link_libraries(ltfn_h4_sequence PRIVATE ltfn_core)
 
+add_executable(ltfn_tinylm
+    src/tinylm_main.cpp
+    src/tinylm.cpp
+)
+
+target_include_directories(ltfn_tinylm
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_link_libraries(ltfn_tinylm
+    PRIVATE
+        Eigen3::Eigen
+)
+
+if(MSVC)
+    target_compile_options(ltfn_tinylm PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(ltfn_tinylm PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 install(TARGETS ltfn_train
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
